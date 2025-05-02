@@ -1,0 +1,19 @@
+[package]
+name = "scheduling_service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+futures = "0.3.31"
+prost = "0.13.5"
+scylla = "1.1.0"
+serde = {version = "1.0.219", features=["derive"]}
+tokio = { version = "1", features = ["full"] }
+tonic = "0.13.0"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
+uuid = {version = "1.16.0", features = ["serde", "v4"]}
+
+
+[build-dependencies]
+tonic-build = "0.13.0"

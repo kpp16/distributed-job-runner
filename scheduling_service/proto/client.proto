@@ -1,0 +1,26 @@
+syntax = "proto3";
+package client;
+
+service ClientService {
+  rpc ReceiveTask(Task) returns (TaskAcceptance);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+message Task {
+  string job_id = 1;
+  int64 execution_time = 2;
+}
+
+message TaskAcceptance {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message HeartbeatRequest {
+  string orchestrator_id = 1;
+}
+
+message HeartbeatResponse {
+  string client_id = 1;
+  string status = 2;
+}

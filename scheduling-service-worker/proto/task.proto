@@ -1,0 +1,15 @@
+syntax = "proto3";
+package task;
+
+service TaskService {
+    rpc SubmitTask(TaskRequest) returns (TaskResponse);
+}
+
+message TaskRequest {
+    string job_id = 1;
+    int64 execution_time = 2;
+}
+
+message TaskResponse {
+    string status = 1;
+}
