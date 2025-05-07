@@ -17,10 +17,10 @@ message TaskAcceptance {
 }
 
 message HeartbeatRequest {
-  string orchestrator_id = 1;
+  int32 segment = 1;
 }
 
 message HeartbeatResponse {
-  string client_id = 1;
+  bool alive = 1;
   string status = 2;
 }

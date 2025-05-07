@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime};
+use std::time::{Duration, SystemTime};
 use tokio::time;
 use uuid::Uuid;
 
@@ -8,8 +8,10 @@ use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use scylla::value::CqlTimestamp;
 use futures::stream::TryStreamExt;
-
+use rand::prelude::IndexedRandom;
 use serde::de::StdError;
+use crate::task::{HeartbeatRequest};
+use tokio::{select};
 
 pub mod task {
     tonic::include_proto!("task");
@@ -49,16 +51,25 @@ fn parse_run_interval_to_mins(input: &str) -> i64 {
 
 type Result<T> = std::result::Result<T, Box<dyn StdError>>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct JobRecord {
     job_id: Uuid,
     next_execution_time: i64,
     segment: i32,
 }
 
+#[derive(Clone)]
+struct ClientStatus {
+    last_execution_time: SystemTime,
+    status: bool,
+}
+
 struct Orchestrator {
     session: Session,
-    client_connections: Arc<Mutex<HashMap<i32, task::task_service_client::TaskServiceClient<tonic::transport::Channel>>>>,
+    client_connections: Arc<Mutex<HashMap<String, task::task_service_client::TaskServiceClient<tonic::transport::Channel>>>>,
+    client_statuses: Arc<Mutex<HashMap<String, ClientStatus>>>,
+    client_addresses: Arc<Mutex<HashMap<String, Vec<i32>>>>,
+    segment_addresses: Arc<Mutex<HashMap<i32, String>>>
 }
 
 impl Orchestrator {
@@ -70,18 +81,102 @@ impl Orchestrator {
         Ok(Self {
             session,
             client_connections: Arc::new(Mutex::new(HashMap::new())),
+            client_statuses: Arc::new(Mutex::new(HashMap::new())),
+            client_addresses: Arc::new(Mutex::new(HashMap::new())),
+            segment_addresses: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    async fn connect_to_clients(&mut self, client_addresses: HashMap<i32, String>) -> Result<()> {
+    async fn initial_connect_to_clients(&mut self, client_addresses: HashMap<String, Vec<i32>>) -> Result<()> {
         let mut connections = self.client_connections.lock().unwrap();
 
-        for (segment, address) in client_addresses {
-            tracing::info!("Connecting client for segment {}: {}", segment, address);
+        self.client_addresses = Arc::new(Mutex::new(client_addresses.clone()));
 
-            let client = task::task_service_client::TaskServiceClient::connect(address).await?;
-            connections.insert(segment, client);
+        for (address, segments) in client_addresses {
+            for segment in segments.clone() {
+                tracing::info!("Connecting client for segment {}: {}", segment, address);
+
+                let client = task::task_service_client::TaskServiceClient::connect(address.clone()).await?;
+                connections.insert(address.clone(), client);
+                self.segment_addresses.lock().unwrap().insert(segment, address.clone());
+            }
         }
+        Ok(())
+    }
+
+    async fn rebalance_segment_jobs(&mut self) -> Result<()> {
+        tracing::info!("rebalance segment jobs");
+
+        let mut dead_segments: Vec<i32> = Vec::new();
+        let mut alive_connections: Vec<String> = Vec::new();
+
+        for (connection, client_status) in &self.client_statuses.lock().unwrap().clone() {
+            if !client_status.status {
+                let cur_dead_segments = self.client_addresses.lock().unwrap().get(connection).unwrap().clone();
+                for dead_segment in cur_dead_segments {
+                    dead_segments.push(dead_segment.clone());
+                }
+                self.client_connections.lock().unwrap().remove(connection).unwrap();
+            } else {
+                alive_connections.push(connection.clone());
+            }
+        }
+
+        for dead_segment in dead_segments {
+            let mut rng = rand::rng();
+            let conn = alive_connections.choose(&mut rng);
+
+            match conn {
+                Some(conn) => {
+                    tracing::info!("rebalancing dead segment {} to {}", dead_segment, conn);
+                    let mut segments = self.client_addresses.lock().unwrap().get(&conn.clone()).unwrap_or(&vec![]).clone();
+                    segments.push(dead_segment);
+                    self.client_addresses.lock().unwrap().insert(conn.clone(), segments.clone());
+                    self.segment_addresses.lock().unwrap().insert(dead_segment, conn.clone());
+                },
+                _ => {
+                    tracing::error!("Failed to rebalance connection");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn perform_heartbeat(&mut self) -> Result<()> {
+        let mut connections = self.client_connections.lock().unwrap().clone();
+
+        for (connection, client) in connections.iter_mut() {
+            let heart_beat_request = HeartbeatRequest {
+                heartbeat: 1,
+            };
+            tracing::info!("Sending heartbeat request");
+            let tonic_request = tonic::Request::new(heart_beat_request);
+
+            let default_cs = ClientStatus {
+                last_execution_time: SystemTime::now(),
+                status: false
+            };
+            let mut client_status: ClientStatus = self.client_statuses.lock().unwrap().get(connection).unwrap_or(&default_cs.clone()).clone();
+
+            match client.heartbeat(tonic_request).await {
+                Ok(response) => {
+                    tracing::info!("Received heartbeat response");
+                    let response = response.into_inner();
+                    client_status = ClientStatus {
+                        last_execution_time: SystemTime::now(),
+                        status: response.alive
+                    };
+                    self.client_statuses.lock().unwrap().insert(connection.clone(), client_status);
+                },
+                Err(e) => {
+                    tracing::error!("Failed to receive heartbeat response for connection: {}. Error: {}", connection, e);
+                    self.client_statuses.lock().unwrap().insert(connection.clone(), client_status.clone());
+                    self.rebalance_segment_jobs().await?;
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -133,8 +228,8 @@ impl Orchestrator {
         for job in jobs {
             let segment = job.segment;
 
-            if let Some(client) = self.client_connections.lock().unwrap().get(&job.segment) {
-                let mut client = client.clone();
+            if let Some(client_addr) = self.segment_addresses.lock().unwrap().get(&job.segment) {
+                let mut client = self.client_connections.lock().unwrap().get(client_addr).unwrap().clone();
 
                 tracing::info!("Dispatching job {:?} to segment {}", job, segment);
 
@@ -155,30 +250,38 @@ impl Orchestrator {
                     }
                 }
             } else {
-                // TODO: redistribute segments hashmap
-                tracing::error!("No client connected for segment {}", segment);
+                // Shouldn't arrive here due to the heart beat system running more frequently than dispatch jobs
+                // but IDK
+                tracing::error!("No client connected for segment {}. Retry submitting job", segment);
             }
-
         }
         Ok(())
     }
 
-    async fn run(&mut self, interval_seconds: u64) {
-        let mut interval = time::interval(time::Duration::from_secs(interval_seconds));
+    async fn run(&mut self, job_interval_secs: u64, heartbeat_interval_secs: u64) {
+        let mut job_interval = time::interval(Duration::from_secs(job_interval_secs));
+        let mut heartbeat_interval = time::interval(Duration::from_secs(heartbeat_interval_secs));
 
         loop {
-            interval.tick().await;
-
-            match self.fetch_due_jobs().await {
-                Ok(jobs) => {
-                    if !jobs.is_empty() {
-                        if let Err(e) = self.dispatch_jobs(jobs).await {
-                            tracing::error!("Failed to dispatch jobs: {}", e);
+            select! {
+                _ = job_interval.tick() => {
+                    match self.fetch_due_jobs().await {
+                        Ok(jobs) => {
+                            if !jobs.is_empty() {
+                                if let Err(e) = self.dispatch_jobs(jobs).await {
+                                    tracing::error!("Failed to dispatch jobs: {}", e);
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            tracing::error!("Failed to fetch jobs: {}", e);
                         }
                     }
-                },
-                Err(e) => {
-                    tracing::error!("Failed to fetch jobs: {}", e);
+                }
+                _ = heartbeat_interval.tick() => {
+                    if let Err(e) = self.perform_heartbeat().await {
+                        tracing::error!("Heartbeat failed: {}", e);
+                    }
                 }
             }
         }
@@ -193,16 +296,16 @@ async fn main() -> Result<()> {
 
     let mut client_addresses = HashMap::new();
     
-    client_addresses.insert(1, "http://[::1]:50051".to_string());
-    client_addresses.insert(2, "http://[::1]:50052".to_string());
-    client_addresses.insert(3, "http://[::1]:50053".to_string());
-    client_addresses.insert(4, "http://[::1]:50054".to_string());
-    client_addresses.insert(5, "http://[::1]:50055".to_string());
+    client_addresses.insert("http://[::1]:50051".to_string(), vec![1]);
+    client_addresses.insert("http://[::1]:50052".to_string(), vec![2]);
+    client_addresses.insert("http://[::1]:50053".to_string(), vec![3]);
+    client_addresses.insert("http://[::1]:50054".to_string(), vec![4]);
+    client_addresses.insert("http://[::1]:50055".to_string(), vec![5]);
 
-    orchestrator.connect_to_clients(client_addresses).await?;
+    orchestrator.initial_connect_to_clients(client_addresses).await?;
 
     tracing::info!("Orchestrator started. Checking for jobs every 60 seconds...");
-    orchestrator.run(60).await;
+    orchestrator.run(60, 10).await;
 
     Ok(())
 }

@@ -3,6 +3,7 @@ package task;
 
 service TaskService {
     rpc SubmitTask(TaskRequest) returns (TaskResponse);
+    rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 }
 
 message TaskRequest {
@@ -12,4 +13,12 @@ message TaskRequest {
 
 message TaskResponse {
     string status = 1;
+}
+
+message HeartbeatRequest {
+    int32 heartbeat = 1;
+}
+
+message HeartbeatResponse {
+    bool alive = 1;
 }

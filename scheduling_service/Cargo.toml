@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 futures = "0.3.31"
 prost = "0.13.5"
+rand = "0.9.1"
 scylla = "1.1.0"
 serde = {version = "1.0.219", features=["derive"]}
 tokio = { version = "1", features = ["full"] }
