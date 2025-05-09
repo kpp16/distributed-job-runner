@@ -6,6 +6,7 @@ use task::task_service_server::{TaskService, TaskServiceServer};
 use task::{TaskRequest, TaskResponse};
 
 use std::time::Duration;
+use crate::task::{HeartbeatRequest, HeartbeatResponse};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -13,19 +14,19 @@ pub mod task {
     tonic::include_proto!("task");
 }
 
-#[derive(Debug)]
-struct TaskClient {
+#[derive(Debug, Default)]
+pub struct TaskClientService {
     segment: i32,
     topic_name: String,
     broker: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct JobRecord {
     job_id: String
 }
 
-impl TaskClient {
+impl TaskClientService {
     fn new(segment: i32) -> Self {
         Self {
             segment,
@@ -60,9 +61,13 @@ impl TaskClient {
     }
 }
 
-#[tonic::async_trait]
-impl TaskService for TaskClient {
-    async fn submit_task(&self, request: Request<TaskRequest>) -> std::result::Result<Response<TaskResponse>, Status> {
+#[tonic::async_trait] // This macro is essential for implementing async traits
+impl TaskService for TaskClientService {
+    // Implementation for the SubmitTask RPC
+    async fn submit_task(
+        &self,
+        request: Request<TaskRequest>, // The incoming request message is wrapped in tonic::Request
+    ) -> std::result::Result<Response<TaskResponse>, Status> { // The response is wrapped in tonic::Response and Result
         let req = request.into_inner();
         let job_id = req.job_id;
         let execution_time = req.execution_time;
@@ -72,16 +77,40 @@ impl TaskService for TaskClient {
             self.segment, job_id, execution_time
         );
 
-        match self.process_job(job_id).await {
-            Ok(res) => {
+        // Use the process_job helper method
+        match self.process_job(job_id.clone()).await { // Clone job_id for the Ok branch
+            Ok((_, processed_job_id)) => { // Destructure the tuple from process_job
                 Ok(Response::new(TaskResponse {
-                    status: res.1
+                    status: format!("Job {} processed successfully", processed_job_id) // Use processed_job_id
                 }))
             },
             Err(e) => {
-                Err(Status::internal(format!("Failed to process job {}", e)))
+                // Log the error and return a gRPC Status error
+                tracing::error!("Error processing job {}: {}", job_id, e);
+                Err(Status::internal(format!("Failed to process job {}: {}", job_id, e)))
             }
         }
+    }
+
+    // Implementation for the Heartbeat RPC (Corrected name and message types)
+    async fn heartbeat( // Changed method name to heartbeat
+                        &self,
+                        request: Request<HeartbeatRequest>, // Changed request message type
+    ) -> std::result::Result<Response<HeartbeatResponse>, Status> { // Changed response message type
+        println!("Got a heartbeat");
+
+        // Extract the inner message (using the correct type)
+        let heartbeat_request = request.into_inner();
+
+        // Process the heartbeat (e.g., update a timestamp, check if the client is alive)
+        println!("Received heartbeat value: {}", heartbeat_request.heartbeat);
+
+        // Create the response message (using the correct type)
+        let reply = HeartbeatResponse {
+            alive: true, // Indicate that the server is alive
+        };
+        // Return the response
+        Ok(Response::new(reply))
     }
 }
 
@@ -98,7 +127,7 @@ async fn main() -> Result<()> {
     let port = 50050 + segment;
     let addr = format!("[::1]:{}", port).parse()?;
     
-    let client = TaskClient::new(segment);
+    let client = TaskClientService::new(segment);
 
     println!("Client for segment {} starting on {}", segment, addr);
     

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::time;
@@ -69,7 +69,7 @@ struct Orchestrator {
     client_connections: Arc<Mutex<HashMap<String, task::task_service_client::TaskServiceClient<tonic::transport::Channel>>>>,
     client_statuses: Arc<Mutex<HashMap<String, ClientStatus>>>,
     client_addresses: Arc<Mutex<HashMap<String, Vec<i32>>>>,
-    segment_addresses: Arc<Mutex<HashMap<i32, String>>>
+    segment_addresses: Arc<Mutex<HashMap<i32, String>>>,
 }
 
 impl Orchestrator {
@@ -83,7 +83,7 @@ impl Orchestrator {
             client_connections: Arc::new(Mutex::new(HashMap::new())),
             client_statuses: Arc::new(Mutex::new(HashMap::new())),
             client_addresses: Arc::new(Mutex::new(HashMap::new())),
-            segment_addresses: Arc::new(Mutex::new(HashMap::new())),
+            segment_addresses: Arc::new(Mutex::new(HashMap::new()))
         })
     }
 
@@ -109,17 +109,27 @@ impl Orchestrator {
 
         let mut dead_segments: Vec<i32> = Vec::new();
         let mut alive_connections: Vec<String> = Vec::new();
+        let mut dead_addresses: Vec<String> = Vec::new();
 
         for (connection, client_status) in &self.client_statuses.lock().unwrap().clone() {
+            tracing::info!("Client status: {}", client_status.status);
             if !client_status.status {
-                let cur_dead_segments = self.client_addresses.lock().unwrap().get(connection).unwrap().clone();
-                for dead_segment in cur_dead_segments {
-                    dead_segments.push(dead_segment.clone());
+                let cur_dead_segments = self.client_addresses.lock().unwrap().get(connection).unwrap_or(&vec![]).clone();
+                if cur_dead_segments.len() > 0 {
+                    for dead_segment in cur_dead_segments {
+                        dead_segments.push(dead_segment.clone());
+                    }
+                    dead_addresses.push(connection.to_string());
                 }
-                self.client_connections.lock().unwrap().remove(connection).unwrap();
             } else {
                 alive_connections.push(connection.clone());
             }
+        }
+    
+        for connection in dead_addresses {
+            tracing::info!("Remove from client connection: {}", connection);
+            self.client_connections.lock().unwrap().remove(&connection).unwrap();
+            self.client_statuses.lock().unwrap().remove(&connection).unwrap();
         }
 
         for dead_segment in dead_segments {
@@ -150,7 +160,7 @@ impl Orchestrator {
             let heart_beat_request = HeartbeatRequest {
                 heartbeat: 1,
             };
-            tracing::info!("Sending heartbeat request");
+            tracing::info!("Sending heartbeat request to: {}", connection);
             let tonic_request = tonic::Request::new(heart_beat_request);
 
             let default_cs = ClientStatus {
@@ -161,7 +171,7 @@ impl Orchestrator {
 
             match client.heartbeat(tonic_request).await {
                 Ok(response) => {
-                    tracing::info!("Received heartbeat response");
+                    tracing::info!("Received heartbeat response from: {}", connection);
                     let response = response.into_inner();
                     client_status = ClientStatus {
                         last_execution_time: SystemTime::now(),
@@ -171,7 +181,9 @@ impl Orchestrator {
                 },
                 Err(e) => {
                     tracing::error!("Failed to receive heartbeat response for connection: {}. Error: {}", connection, e);
-                    self.client_statuses.lock().unwrap().insert(connection.clone(), client_status.clone());
+                    let mut failed_cl_status = client_status.clone();
+                    failed_cl_status.status = false;
+                    self.client_statuses.lock().unwrap().insert(connection.clone(), failed_cl_status);
                     self.rebalance_segment_jobs().await?;
                 }
             }
@@ -181,11 +193,12 @@ impl Orchestrator {
     }
 
     async fn fetch_due_jobs(&self) -> Result<Vec<JobRecord>> {
+        tracing::info!("Fetching due jobs");
         let now_mins = (SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs() / 60) as i64;
         let session = &self.session;
         let mut results: Vec<JobRecord> = Vec::new();
 
-        let mut iter = session.query_iter("SELECT next_execution_time, job_id, segment FROM dist_task_runner.task_schedule WHERE next_execution_time <= ?", (now_mins, ))
+        let mut iter = session.query_iter("SELECT next_execution_time, job_id, segment FROM dist_task_runner.task_schedule WHERE next_execution_time <= ? ALLOW FILTERING", (now_mins, ))
             .await?
             .rows_stream::<(i64, Uuid, i32)>()?;
 
@@ -199,7 +212,7 @@ impl Orchestrator {
             });
 
             // calculate and update the next execution time
-            let int_res = session.query_unpaged("SELECT run_interval FROM dist_task_runner.task_schedule WHERE job_od = ?", (job_id,))
+            let int_res = session.query_unpaged("SELECT run_interval FROM dist_task_runner.task_schedule WHERE job_od = ? ALLOW FILTERING", (job_id,))
                 .await?
                 .into_rows_result()?;
 
@@ -217,7 +230,7 @@ impl Orchestrator {
             if next_time_delta != -1 {
                 let next_time_ms = now_mins + next_time_delta;
                 let next_time_ts = CqlTimestamp(next_time_ms);
-                session.query_unpaged("UPDATE dist_task_runner.task_schedule SET next_execution_time = ? WHERE job_id = ?", (next_time_ts, job_id))
+                session.query_unpaged("UPDATE dist_task_runner.task_schedule SET next_execution_time = ? WHERE job_id = ? ALLOW FILTERING", (next_time_ts, job_id))
                     .await?;
             }
         }
